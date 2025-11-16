@@ -14,7 +14,7 @@ HashiCorp의 공식 블로그 [Validated Patterns: AI Agent Identity with HashiC
 
 ## 데모
 
-![MCP Remote Vault Demo](mcp-remote-vault-demo.mp4)
+![MCP Remote Vault Demo](mcp-remote-vault-demo.gif)
 
 
 ### 구성 요소
