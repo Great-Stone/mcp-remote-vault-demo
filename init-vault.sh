@@ -121,6 +121,40 @@ if [ -z "$JWT_ACCESSOR" ]; then
 fi
 echo "JWT accessor: $JWT_ACCESSOR"
 
+# Clean up any existing auto-generated entities and aliases
+echo "Cleaning up any existing auto-generated entities and aliases..."
+echo "This ensures we create entities with proper names (alice, bob) instead of auto-generated names"
+
+# Get all existing entities
+EXISTING_ENTITIES=$(docker exec -e VAULT_TOKEN=root-token vault vault list -format=json identity/entity/name 2>/dev/null || echo "[]")
+for entity_name in $(echo "$EXISTING_ENTITIES" | python3 -c "import sys, json; [print(name) for name in json.load(sys.stdin)]" 2>/dev/null); do
+  if [ -n "$entity_name" ]; then
+    # Check if this is an auto-generated entity name (starts with "entity_")
+    if echo "$entity_name" | grep -q "^entity_"; then
+      echo "Found auto-generated entity: $entity_name, deleting it..."
+      # Get entity ID first to delete associated aliases
+      ENTITY_DATA=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity/name/$entity_name 2>/dev/null || echo "{}")
+      ENTITY_ID=$(echo "$ENTITY_DATA" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('id', ''))" 2>/dev/null || echo "")
+      if [ -n "$ENTITY_ID" ]; then
+        # Delete all aliases for this entity
+        ALIAS_LIST=$(docker exec -e VAULT_TOKEN=root-token vault vault list -format=json identity/entity-alias/id 2>/dev/null || echo "[]")
+        for alias_id in $(echo "$ALIAS_LIST" | python3 -c "import sys, json; [print(aid) for aid in json.load(sys.stdin)]" 2>/dev/null); do
+          if [ -n "$alias_id" ]; then
+            ALIAS_DATA=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity-alias/id/$alias_id 2>/dev/null || echo "{}")
+            ALIAS_CANONICAL_ID=$(echo "$ALIAS_DATA" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('canonical_id', ''))" 2>/dev/null || echo "")
+            if [ "$ALIAS_CANONICAL_ID" = "$ENTITY_ID" ]; then
+              echo "  Deleting alias: $alias_id"
+              docker exec -e VAULT_TOKEN=root-token vault vault delete identity/entity-alias/id/$alias_id 2>/dev/null || true
+            fi
+          fi
+        done
+      fi
+      # Delete the entity
+      docker exec -e VAULT_TOKEN=root-token vault vault delete identity/entity/name/$entity_name 2>/dev/null || true
+    fi
+  fi
+done
+
 # Create entities for Keycloak users
 echo "Creating Vault entities for Keycloak users..."
 
@@ -155,36 +189,155 @@ if [ -z "$KC_TOKEN" ] || [ "$KC_TOKEN" == "None" ] || [ "$KC_TOKEN" == "" ]; the
 else
   # Get users from Keycloak
   echo "Fetching users from Keycloak..."
-  USERS_JSON=$(curl -s -X GET "http://localhost:8080/admin/realms/mcp-demo/users" \
-    -H "Authorization: Bearer ${KC_TOKEN}")
+  CURL_OUTPUT=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X GET "http://localhost:8080/admin/realms/mcp-demo/users" \
+    -H "Authorization: Bearer ${KC_TOKEN}" 2>&1)
   
-  # Create entity for each user
-  echo "$USERS_JSON" | python3 <<PYTHON_SCRIPT | while IFS='|' read -r user_id username; do
-import sys
-import json
-
+  # Extract HTTP status code
+  HTTP_CODE=$(echo "$CURL_OUTPUT" | grep "HTTP_CODE:" | sed 's/.*HTTP_CODE://')
+  USERS_JSON=$(echo "$CURL_OUTPUT" | sed '/HTTP_CODE:/d')
+  
+  # Check if curl failed
+  if [ -z "$HTTP_CODE" ]; then
+    echo "Error: Failed to connect to Keycloak"
+    echo "Output: $CURL_OUTPUT"
+    exit 1
+  fi
+  
+  # Check HTTP status code
+  if [ "$HTTP_CODE" != "200" ]; then
+    echo "Error: Failed to fetch users from Keycloak (HTTP $HTTP_CODE)"
+    if [ -n "$USERS_JSON" ]; then
+      echo "Response: $(echo "$USERS_JSON" | head -c 200)"
+    fi
+    exit 1
+  fi
+  
+  # Check if response is empty
+  if [ -z "$USERS_JSON" ] || [ "$USERS_JSON" = "" ]; then
+    echo "Error: Empty response from Keycloak"
+    echo "Make sure init-keycloak.sh has been run successfully and users exist"
+    exit 1
+  fi
+  
+  # Parse users and create entities using a temporary file to avoid subshell issues
+  echo "Parsing users from Keycloak..."
+  
+  # Check if we got valid JSON
+  if ! echo "$USERS_JSON" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
+    echo "Error: Invalid JSON response from Keycloak"
+    echo "Response (first 500 chars): $(echo "$USERS_JSON" | head -c 500)"
+    exit 1
+  fi
+  
+  # Parse users using Python (simpler inline approach)
+  echo "Extracting user information..."
+  TEMP_USERS_FILE=$(mktemp)
+  TEMP_PYTHON_SCRIPT=$(mktemp)
+  
+  # Create Python script to avoid quote escaping issues
+  cat > "$TEMP_PYTHON_SCRIPT" <<'PYEOF'
+import sys, json
 try:
     users = json.load(sys.stdin)
+    count = 0
     for user in users:
-        user_id = user.get('id', '')
-        username = user.get('username', '')
-        if user_id and username:
-            # Create entity with name = username (for easier management)
-            print(f"Creating entity for user: {username} (ID: {user_id})")
-            # Entity creation will be done via docker exec
-            print(f"{user_id}|{username}")
+        uid = user.get('id', '')
+        uname = user.get('username', '')
+        if uid and uname:
+            count += 1
+            print('{}|{}'.format(uid, uname))
+    if count == 0:
+        print('ERROR: No users found', file=sys.stderr)
+        sys.exit(1)
 except Exception as e:
-    print(f"Error: {e}", file=sys.stderr)
+    print('ERROR: {}'.format(e), file=sys.stderr)
     sys.exit(1)
-PYTHON_SCRIPT
+PYEOF
+  
+  echo "$USERS_JSON" | python3 "$TEMP_PYTHON_SCRIPT" > "$TEMP_USERS_FILE" 2>&1
+  PYTHON_EXIT_CODE=$?
+  
+  # Clean up Python script
+  rm -f "$TEMP_PYTHON_SCRIPT"
+  
+  if [ $PYTHON_EXIT_CODE -ne 0 ]; then
+    PYTHON_ERROR=$(cat "$TEMP_USERS_FILE" 2>&1)
+    echo "Error: Failed to parse users from Keycloak"
+    echo "Python error: $PYTHON_ERROR"
+    echo "JSON response length: $(echo "$USERS_JSON" | wc -c) bytes"
+    rm -f "$TEMP_USERS_FILE"
+    exit 1
+  fi
+  
+  # Verify temp file was created and has content
+  if [ ! -f "$TEMP_USERS_FILE" ]; then
+    echo "Error: Temporary users file was not created"
+    exit 1
+  fi
+  
+  USER_COUNT=$(wc -l < "$TEMP_USERS_FILE" 2>/dev/null | tr -d ' ' || echo "0")
+  if [ -z "$USER_COUNT" ] || [ "$USER_COUNT" = "0" ]; then
+    echo "Warning: No users found in Keycloak realm 'mcp-demo'"
+    echo "Make sure init-keycloak.sh has been run successfully"
+    echo "Temp file content: $(cat "$TEMP_USERS_FILE" 2>/dev/null || echo 'empty')"
+    rm -f "$TEMP_USERS_FILE"
+    exit 1
+  fi
+  
+  echo "Found $USER_COUNT user(s) in Keycloak:"
+  while IFS='|' read -r user_id username; do
     if [ -n "$user_id" ] && [ -n "$username" ]; then
-      echo "Creating entity for user: $username (ID: $user_id)"
+      echo "  - $username (ID: $user_id)"
+    fi
+  done < "$TEMP_USERS_FILE"
+
+  # Process each user from the temp file
+  while IFS='|' read -r user_id username; do
+    if [ -n "$user_id" ] && [ -n "$username" ]; then
+      echo ""
+      echo "=== Processing user: $username (Keycloak ID: $user_id) ==="
       
-      # Delete existing entity if it exists (by name)
-      echo "Deleting existing entity if exists (by name: $username)..."
-      docker exec -e VAULT_TOKEN=root-token vault vault delete identity/entity/name/$username 2>/dev/null || true
+      # Delete existing entity if it exists (by name) and all its aliases
+      echo "Step 1: Cleaning up existing entity (if any) for username: $username..."
+      EXISTING_ENTITY_READ=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity/name/$username 2>/dev/null || echo "{}")
+      EXISTING_ENTITY_ID=$(echo "$EXISTING_ENTITY_READ" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('id', ''))" 2>/dev/null || echo "")
+      if [ -n "$EXISTING_ENTITY_ID" ]; then
+        echo "  Found existing entity: $EXISTING_ENTITY_ID, deleting all aliases..."
+        # Delete all aliases for this entity
+        ALIAS_LIST=$(docker exec -e VAULT_TOKEN=root-token vault vault list -format=json identity/entity-alias/id 2>/dev/null || echo "[]")
+        for alias_id in $(echo "$ALIAS_LIST" | python3 -c "import sys, json; [print(aid) for aid in json.load(sys.stdin)]" 2>/dev/null); do
+          if [ -n "$alias_id" ]; then
+            ALIAS_DATA=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity-alias/id/$alias_id 2>/dev/null || echo "{}")
+            ALIAS_CANONICAL_ID=$(echo "$ALIAS_DATA" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('canonical_id', ''))" 2>/dev/null || echo "")
+            if [ "$ALIAS_CANONICAL_ID" = "$EXISTING_ENTITY_ID" ]; then
+              echo "    Deleting alias: $alias_id"
+              docker exec -e VAULT_TOKEN=root-token vault vault delete identity/entity-alias/id/$alias_id 2>/dev/null || true
+            fi
+          fi
+        done
+        echo "  Deleting entity: $username"
+        docker exec -e VAULT_TOKEN=root-token vault vault delete identity/entity/name/$username 2>/dev/null || true
+        sleep 1
+      else
+        echo "  No existing entity found for username: $username"
+      fi
+      
+      # Also check for any alias with this user_id and delete it
+      echo "Step 2: Cleaning up any alias with user_id: $user_id..."
+      ALIAS_LIST=$(docker exec -e VAULT_TOKEN=root-token vault vault list -format=json identity/entity-alias/id 2>/dev/null || echo "[]")
+      for alias_id in $(echo "$ALIAS_LIST" | python3 -c "import sys, json; [print(aid) for aid in json.load(sys.stdin)]" 2>/dev/null); do
+        if [ -n "$alias_id" ]; then
+          ALIAS_DATA=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity-alias/id/$alias_id 2>/dev/null || echo "{}")
+          ALIAS_NAME=$(echo "$ALIAS_DATA" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('name', ''))" 2>/dev/null || echo "")
+          if [ "$ALIAS_NAME" = "$user_id" ]; then
+            echo "  Found existing alias with user_id: $alias_id, deleting it..."
+            docker exec -e VAULT_TOKEN=root-token vault vault delete identity/entity-alias/id/$alias_id 2>/dev/null || true
+          fi
+        fi
+      done
       
       # Create entity with name = username (for easier management)
+      echo "Step 3: Creating entity with name: $username..."
       ENTITY_RESPONSE=$(docker exec -e VAULT_TOKEN=root-token vault vault write -format=json identity/entity \
         name="$username" \
         metadata=user_id="$user_id" \
@@ -193,56 +346,112 @@ PYTHON_SCRIPT
       # Get entity ID
       ENTITY_ID=$(echo "$ENTITY_RESPONSE" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('data', {}).get('id', ''))" 2>/dev/null || echo "")
       
+      # Verify entity was created
       if [ -z "$ENTITY_ID" ]; then
-        # Entity may already exist, try to read it
-        ENTITY_READ=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity/name/$username 2>/dev/null || echo "")
-        if [ -n "$ENTITY_READ" ]; then
-          ENTITY_ID=$(echo "$ENTITY_READ" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('data', {}).get('id', ''))" 2>/dev/null || echo "")
+        echo "  Warning: Entity creation response did not contain ID, checking if entity exists..."
+        sleep 1
+        ENTITY_READ=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity/name/$username 2>/dev/null || echo "{}")
+        ENTITY_ID=$(echo "$ENTITY_READ" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('data', {}).get('id', ''))" 2>/dev/null || echo "")
+        if [ -z "$ENTITY_ID" ]; then
+          echo "  ✗ Error: Failed to create or find entity for username: $username"
+          echo "  Response: $ENTITY_RESPONSE"
+          continue
         fi
       fi
       
+      echo "  ✓ Entity created successfully: $ENTITY_ID (name: $username)"
+      
       if [ -n "$ENTITY_ID" ]; then
-        echo "Entity created/updated: $ENTITY_ID"
-        
-        # Delete existing alias if it exists (by canonical_id)
-        echo "Deleting existing alias if exists for entity: $ENTITY_ID..."
-        docker exec -e VAULT_TOKEN=root-token vault vault list -format=json identity/entity-alias/id 2>/dev/null | python3 <<PYTHON_SCRIPT | while IFS='|' read -r alias_id alias_canonical_id; do
-import sys
-import json
-
-try:
-    alias_ids = json.load(sys.stdin)
-    for alias_id in alias_ids:
-        # We'll check canonical_id in bash, not here
-        print(f"{alias_id}")
-except Exception as e:
-    pass
-PYTHON_SCRIPT
-          if [ -n "$alias_id" ]; then
-            ALIAS_CANONICAL_ID=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity-alias/id/$alias_id 2>/dev/null | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('canonical_id', ''))" 2>/dev/null || echo "")
-            if [ "$ALIAS_CANONICAL_ID" = "$ENTITY_ID" ]; then
-              docker exec -e VAULT_TOKEN=root-token vault vault delete identity/entity-alias/id/$alias_id 2>/dev/null || true
-            fi
-          fi
-        done
+        # Attach policy to entity first (before creating alias)
+        echo "Step 4: Attaching policy 'user-secrets' to entity: $username..."
+        POLICY_ATTACH_RESPONSE=$(docker exec -e VAULT_TOKEN=root-token vault vault write identity/entity/id/$ENTITY_ID \
+          policies="user-secrets" 2>&1)
+        if echo "$POLICY_ATTACH_RESPONSE" | grep -q "error"; then
+          echo "  ⚠ Warning: Failed to attach policy, but continuing..."
+          echo "  Response: $POLICY_ATTACH_RESPONSE"
+        else
+          echo "  ✓ Policy 'user-secrets' attached to entity"
+        fi
         
         # Create entity alias (name = Keycloak user ID, which matches JWT 'sub' claim)
-        echo "Creating entity alias for user: $username (alias name: $user_id)"
+        echo "Step 5: Creating entity alias (name: $user_id, matches JWT 'sub' claim)..."
         ALIAS_RESPONSE=$(docker exec -e VAULT_TOKEN=root-token vault vault write -format=json identity/entity-alias \
           name="$user_id" \
           canonical_id="$ENTITY_ID" \
           mount_accessor="$JWT_ACCESSOR" 2>&1)
         
-        if echo "$ALIAS_RESPONSE" | grep -q "error"; then
-          echo "Warning: Failed to create alias for user $username"
+        # Check if alias was created successfully
+        ALIAS_ID=$(echo "$ALIAS_RESPONSE" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('data', {}).get('id', ''))" 2>/dev/null || echo "")
+        
+        if [ -z "$ALIAS_ID" ]; then
+          # Check if alias already exists by searching all aliases
+          echo "  Alias creation returned no ID, checking if alias already exists..."
+          sleep 1
+          EXISTING_ALIAS=""
+          ALIAS_LIST=$(docker exec -e VAULT_TOKEN=root-token vault vault list -format=json identity/entity-alias/id 2>/dev/null || echo "[]")
+          for alias_id in $(echo "$ALIAS_LIST" | python3 -c "import sys, json; [print(aid) for aid in json.load(sys.stdin)]" 2>/dev/null); do
+            if [ -n "$alias_id" ]; then
+              ALIAS_DATA=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity-alias/id/$alias_id 2>/dev/null || echo "{}")
+              ALIAS_NAME=$(echo "$ALIAS_DATA" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('name', ''))" 2>/dev/null || echo "")
+              ALIAS_CANONICAL_ID=$(echo "$ALIAS_DATA" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('canonical_id', ''))" 2>/dev/null || echo "")
+              if [ "$ALIAS_NAME" = "$user_id" ] && [ "$ALIAS_CANONICAL_ID" = "$ENTITY_ID" ]; then
+                EXISTING_ALIAS="$alias_id"
+                break
+              fi
+            fi
+          done
+          
+          if [ -n "$EXISTING_ALIAS" ]; then
+            echo "  ✓ Entity alias already exists: $EXISTING_ALIAS"
+            ALIAS_ID="$EXISTING_ALIAS"
+          else
+            echo "  ✗ Error: Failed to create alias for user $username"
+            echo "  Response: $ALIAS_RESPONSE"
+            # Try to read the error details
+            if echo "$ALIAS_RESPONSE" | grep -q "error"; then
+              ERROR_MSG=$(echo "$ALIAS_RESPONSE" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('errors', ['Unknown error'])[0])" 2>/dev/null || echo "Unknown error")
+              echo "  Error message: $ERROR_MSG"
+            fi
+            echo "  ⚠ Continuing anyway - alias may be created on first login"
+          fi
         else
-          echo "Entity alias created for user: $username"
+          echo "  ✓ Entity alias created successfully: $ALIAS_ID"
         fi
+        
+        # Verify alias is correctly linked to entity
+        if [ -n "$ALIAS_ID" ]; then
+          echo "Step 6: Verifying alias configuration..."
+          VERIFY_ALIAS=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity-alias/id/$ALIAS_ID 2>/dev/null | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('data', {}).get('canonical_id', ''))" 2>/dev/null || echo "")
+          if [ "$VERIFY_ALIAS" = "$ENTITY_ID" ]; then
+            echo "  ✓ Verified: Entity alias correctly linked to entity $ENTITY_ID"
+          else
+            echo "  ⚠ Warning: Entity alias verification failed (canonical_id mismatch)"
+          fi
+          
+          # Verify entity has policy
+          ENTITY_VERIFY=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity/name/$username 2>/dev/null || echo "{}")
+          ENTITY_POLICIES=$(echo "$ENTITY_VERIFY" | python3 -c "import sys, json; print(','.join(json.load(sys.stdin).get('data', {}).get('policies', [])))" 2>/dev/null || echo "")
+          if echo "$ENTITY_POLICIES" | grep -q "user-secrets"; then
+            echo "  ✓ Verified: Policy 'user-secrets' is attached to entity"
+          else
+            echo "  ⚠ Warning: Policy 'user-secrets' is not attached to entity"
+            echo "  Attempting to attach policy again..."
+            docker exec -e VAULT_TOKEN=root-token vault vault write identity/entity/id/$ENTITY_ID \
+              policies="user-secrets" 2>&1 | grep -v "WARNING" || true
+          fi
+        fi
+        
+        echo "  ✓ User $username setup completed successfully!"
+        echo ""
       else
         echo "Warning: Could not create or find entity for user: $username"
       fi
     fi
-  done
+  done < "$TEMP_USERS_FILE"
+  
+  # Clean up temp file
+  rm -f "$TEMP_USERS_FILE"
+  echo "Entity creation process completed for all users."
 fi
 
 # Create JWT role
@@ -388,5 +597,87 @@ fi
 echo "Listing all database roles for verification..."
 docker exec -e VAULT_TOKEN=root-token vault vault list database/roles 2>&1
 
+# Verify entities and aliases were created correctly
+echo ""
+echo "=== Verifying Entity and Alias Configuration ==="
+echo "Fetching users from Keycloak for verification..."
+KC_TOKEN=""
+if [ -n "$KC_TOKEN" ] || [ "$KC_TOKEN" != "None" ]; then
+  KC_TOKEN=$(curl -s -X POST "http://localhost:8080/realms/master/protocol/openid-connect/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "username=admin" \
+    -d "password=admin" \
+    -d "grant_type=password" \
+    -d "client_id=admin-cli" 2>/dev/null | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('access_token', ''))" 2>/dev/null || echo "")
+fi
+
+if [ -n "$KC_TOKEN" ] && [ "$KC_TOKEN" != "None" ] && [ "$KC_TOKEN" != "" ]; then
+  USERS_JSON=$(curl -s -X GET "http://localhost:8080/admin/realms/mcp-demo/users" \
+    -H "Authorization: Bearer ${KC_TOKEN}")
+  
+  echo "$USERS_JSON" | python3 <<PYTHON_SCRIPT | while IFS='|' read -r user_id username; do
+import sys
+import json
+
+try:
+    users = json.load(sys.stdin)
+    for user in users:
+        user_id = user.get('id', '')
+        username = user.get('username', '')
+        if user_id and username:
+            print(f"{user_id}|{username}")
+except Exception as e:
+    pass
+PYTHON_SCRIPT
+    if [ -n "$user_id" ] && [ -n "$username" ]; then
+      echo ""
+      echo "Verifying entity for user: $username (Keycloak ID: $user_id)"
+      
+      # Check entity exists
+      ENTITY_DATA=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity/name/$username 2>/dev/null || echo "{}")
+      ENTITY_ID=$(echo "$ENTITY_DATA" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('id', ''))" 2>/dev/null || echo "")
+      
+      if [ -n "$ENTITY_ID" ]; then
+        echo "  ✓ Entity exists: $ENTITY_ID (name: $username)"
+        
+        # Check entity has policy attached
+        ENTITY_POLICIES=$(echo "$ENTITY_DATA" | python3 -c "import sys, json; print(','.join(json.load(sys.stdin).get('data', {}).get('policies', [])))" 2>/dev/null || echo "")
+        if echo "$ENTITY_POLICIES" | grep -q "user-secrets"; then
+          echo "  ✓ Policy 'user-secrets' is attached to entity"
+        else
+          echo "  ⚠ Warning: Policy 'user-secrets' is not attached to entity"
+        fi
+        
+        # Check alias exists
+        ALIAS_FOUND=false
+        ALIAS_LIST=$(docker exec -e VAULT_TOKEN=root-token vault vault list -format=json identity/entity-alias/id 2>/dev/null || echo "[]")
+        for alias_id in $(echo "$ALIAS_LIST" | python3 -c "import sys, json; [print(aid) for aid in json.load(sys.stdin)]" 2>/dev/null); do
+          if [ -n "$alias_id" ]; then
+            ALIAS_DATA=$(docker exec -e VAULT_TOKEN=root-token vault vault read -format=json identity/entity-alias/id/$alias_id 2>/dev/null || echo "{}")
+            ALIAS_NAME=$(echo "$ALIAS_DATA" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('name', ''))" 2>/dev/null || echo "")
+            ALIAS_CANONICAL_ID=$(echo "$ALIAS_DATA" | python3 -c "import sys, json; print(json.load(sys.stdin).get('data', {}).get('canonical_id', ''))" 2>/dev/null || echo "")
+            if [ "$ALIAS_NAME" = "$user_id" ] && [ "$ALIAS_CANONICAL_ID" = "$ENTITY_ID" ]; then
+              echo "  ✓ Entity alias exists: $alias_id (name: $user_id, matches JWT 'sub' claim)"
+              ALIAS_FOUND=true
+              break
+            fi
+          fi
+        done
+        
+        if [ "$ALIAS_FOUND" = false ]; then
+          echo "  ✗ Error: Entity alias not found for user_id: $user_id"
+          echo "    This will cause authentication failures!"
+        fi
+      else
+        echo "  ✗ Error: Entity not found for username: $username"
+        echo "    This will cause authentication failures!"
+      fi
+    fi
+  done
+else
+  echo "Skipping entity verification (could not get Keycloak token)"
+fi
+
+echo ""
 echo "Vault initialization completed!"
 
